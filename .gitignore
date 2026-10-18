@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+
+# Tool caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Local settings, secrets, logs and generated analysis
+.env
+.env.*
+*.log
+.claude/settings.local.json
+graphify-out/
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# Never commit documents processed locally (tests generate synthetic ones)
+*.docx
+*.doc
+*.odt
+*.rtf
+*.xlsx
+*.xls
+*.pptx
+*.ppt
+*.pdf

@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "offline-doc-tools"
+version = "0.1.0"
+description = "Offline desktop tool for converting Word documents to PDF locally."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    # Essentials = the core Qt modules without the Add-ons; the full PySide6 metapackage would
+    # also pull in add-ons such as Qt WebEngine (Chromium). The app imports only
+    # QtCore/QtGui/QtWidgets.
+    "PySide6-Essentials>=6.8,<7",
+]
+
+[project.optional-dependencies]
+# Pinned to the versions the project was verified with, so lint/format results are
+# reproducible locally and in CI. Bump deliberately.
+dev = [
+    "pytest==9.1.1",
+    "ruff==0.17.1",
+]
+
+[project.gui-scripts]
+offline-doc-tools = "offline_doc_tools.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "integration: runs the real LibreOffice executable (skipped when it is not installed)",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "SIM", "PTH"]
+ignore = [
+    "S603", # subprocess call without shell: argument lists are built internally, never via a shell
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]
