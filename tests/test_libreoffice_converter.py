@@ -1,5 +1,6 @@
 """LibreOffice adapter tests. The subprocess is replaced by a fake runner."""
 
+import errno
 import os
 import subprocess
 import tempfile
@@ -10,8 +11,17 @@ from urllib.request import url2pathname
 import pytest
 
 from conftest import FAKE_PDF_BYTES
-from offline_doc_tools.engine import ConversionFailedError, ConversionTimeoutError
-from offline_doc_tools.libreoffice import LibreOfficeConverter, ProcessResult
+from offline_doc_tools.engine import (
+    ConversionError,
+    ConversionFailedError,
+    ConversionTimeoutError,
+    TemporaryFolderError,
+)
+from offline_doc_tools.libreoffice import (
+    LibreOfficeConverter,
+    ProcessResult,
+    libreoffice_converter,
+)
 
 
 class FakeRunner:
@@ -266,3 +276,131 @@ def test_libreoffice_crash_gets_an_explanatory_message(tmp_path, work):
     message = str(info.value)
     assert "LibreOffice crashed" in message
     assert "temporary folder" in message
+
+
+# --- temporary folder problems: reported as such, never as raw OS errors ----------------
+
+_USER = "Secret Person"  # stands in for the Windows user name inside a path
+
+
+def _missing_folder_reason(folder: Path) -> str:
+    """How this operating system words 'that folder does not exist'."""
+    try:
+        (folder / "probe").mkdir()
+    except OSError as exc:
+        return exc.strerror
+    raise AssertionError("the folder unexpectedly exists")
+
+
+def _assert_path_free(text: str, tmp_path: Path) -> None:
+    assert _USER not in text
+    assert str(tmp_path) not in text
+
+
+def test_missing_temp_folder_stops_the_converter_on_entry(tmp_path, monkeypatch, caplog):
+    missing = tmp_path / _USER / "gone"
+    reason = _missing_folder_reason(missing)
+    monkeypatch.setattr(tempfile, "tempdir", str(missing))
+    caplog.set_level("DEBUG", logger="offline_doc_tools")
+
+    with (
+        pytest.raises(ConversionError) as info,
+        libreoffice_converter(Path(r"C:\LO\soffice.exe")),
+    ):
+        pytest.fail("no converter may be handed out without a place for its profiles")
+
+    message = str(info.value)
+    assert not isinstance(info.value, OSError)
+    assert "temporary folder" in message
+    assert reason in message
+    assert caplog.records, "expected the problem to be logged"
+    _assert_path_free(message, tmp_path)
+    _assert_path_free(caplog.text, tmp_path)
+
+
+def test_unusable_default_temp_folders_are_not_listed_by_the_converter(
+    tmp_path, monkeypatch, caplog
+):
+    # Python's own "No usable temporary directory found in [<every folder tried>]" error.
+    candidates = [str(tmp_path / _USER / "a"), str(tmp_path / _USER / "b")]
+    monkeypatch.setattr(tempfile, "tempdir", None)
+    monkeypatch.setattr(tempfile, "_candidate_tempdir_list", lambda: candidates)
+    caplog.set_level("DEBUG", logger="offline_doc_tools")
+
+    with (
+        pytest.raises(ConversionError) as info,
+        libreoffice_converter(Path(r"C:\LO\soffice.exe")),
+    ):
+        pytest.fail("no converter may be handed out without a place for its profiles")
+
+    assert "temporary folder" in str(info.value)
+    _assert_path_free(str(info.value), tmp_path)
+    _assert_path_free(caplog.text, tmp_path)
+
+
+def test_disk_full_when_creating_the_profile_folder(tmp_path, monkeypatch):
+    def refuse(*args, **kwargs):
+        raise OSError(errno.ENOSPC, "No space left on device", rf"C:\Users\{_USER}\Temp\x")
+
+    monkeypatch.setattr(tempfile, "mkdtemp", refuse)
+    with (
+        pytest.raises(ConversionError) as info,
+        libreoffice_converter(Path(r"C:\LO\soffice.exe")),
+    ):
+        pytest.fail("no converter may be handed out without a place for its profiles")
+    assert "temporary folder" in str(info.value)
+    assert "No space left on device" in str(info.value)
+    assert _USER not in str(info.value)
+
+
+def _permission_denied(path):
+    return PermissionError(errno.EACCES, "Permission denied", str(path))
+
+
+def _disk_full(path):
+    return OSError(errno.ENOSPC, "No space left on device", str(path))
+
+
+@pytest.mark.parametrize(
+    ("method", "name", "make_error", "reason"),
+    [
+        ("read_text", "registrymodifications.xcu", _permission_denied, "Permission denied"),
+        ("write_text", "registrymodifications.xcu", _disk_full, "No space left on device"),
+        ("mkdir", "user", _disk_full, "No space left on device"),
+        ("mkdir", "tmp", _permission_denied, "Permission denied"),
+    ],
+    ids=["read-settings", "write-settings", "profile-folder", "libreoffice-temp-folder"],
+)
+def test_profile_preparation_failures_are_temp_folder_problems(
+    tmp_path, work, monkeypatch, caplog, method, name, make_error, reason
+):
+    source, outdir = work
+    real = getattr(Path, method)
+
+    def failing(self, *args, **kwargs):
+        if self.name == name:
+            raise make_error(self)
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, method, failing)
+    caplog.set_level("DEBUG", logger="offline_doc_tools")
+    runner = FakeRunner()
+
+    with pytest.raises(ConversionError) as info:
+        _converter(tmp_path, runner).convert_to_pdf(source, outdir)
+
+    message = str(info.value)
+    assert not isinstance(info.value, OSError)
+    assert "temporary folder" in message and reason in message
+    assert "Could not start LibreOffice" not in message
+    assert runner.calls == []  # LibreOffice is never started with a broken profile
+    _assert_path_free(message, tmp_path)
+    _assert_path_free(caplog.text, tmp_path)
+
+
+def test_a_temp_folder_error_from_the_runner_is_not_blamed_on_libreoffice(tmp_path, work):
+    source, outdir = work
+    error = TemporaryFolderError("Could not create files in the temporary folder (x).")
+    with pytest.raises(TemporaryFolderError) as info:
+        _converter(tmp_path, FakeRunner(raise_exc=error)).convert_to_pdf(source, outdir)
+    assert info.value is error

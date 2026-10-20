@@ -16,7 +16,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from .engine import ConversionFailedError, ConversionTimeoutError
+from .engine import (
+    ConversionFailedError,
+    ConversionTimeoutError,
+    TemporaryFolderError,
+    os_reason,
+)
 
 log = logging.getLogger(__name__)
 
@@ -124,7 +129,8 @@ def run_process(
     """Run ``args`` without a shell. On timeout, kill the whole process tree and re-raise.
 
     Output goes to anonymous temporary files rather than pipes, so a grandchild process that
-    keeps the handles open can never block us, and only the last 64 KiB is kept.
+    keeps the handles open can never block us, and only the last 64 KiB is kept. Raises
+    ``TemporaryFolderError``, without starting anything, if those files cannot be created.
     """
     popen_kwargs: dict = {}
     if sys.platform == "win32":
@@ -132,7 +138,7 @@ def run_process(
     else:
         popen_kwargs["start_new_session"] = True
 
-    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+    with _capture_file() as stdout, _capture_file() as stderr:
         proc = subprocess.Popen(
             list(args),
             stdin=subprocess.DEVNULL,
@@ -147,6 +153,17 @@ def run_process(
             _kill_tree(proc)
             raise
         return ProcessResult(returncode, _tail(stdout), _tail(stderr))
+
+
+def _capture_file():
+    """An anonymous temporary file to collect a child process's output in."""
+    try:
+        return tempfile.TemporaryFile()
+    except OSError as exc:
+        # Not "could not start LibreOffice": the temporary folder is what is wrong.
+        raise TemporaryFolderError.from_os_error(
+            "create files for LibreOffice's output in", exc
+        ) from exc
 
 
 def _tail(handle, limit: int = _OUTPUT_LIMIT_BYTES) -> bytes:
@@ -226,7 +243,19 @@ class LibreOfficeConverter:
         return self._profile_root / f"p{self._profile_generation}"
 
     def _prepare_profile(self) -> dict[str, str]:
-        """Ensure the link-blocking setting is in place; return the child's environment."""
+        """Ensure the link-blocking setting is in place; return the child's environment.
+
+        The profile lives in the temporary folder, so a failure here (full disk, folder gone,
+        no permission) is reported as a temporary folder problem, before LibreOffice starts.
+        """
+        try:
+            return self._write_profile()
+        except OSError as exc:
+            raise TemporaryFolderError.from_os_error(
+                "prepare LibreOffice's profile in", exc
+            ) from exc
+
+    def _write_profile(self) -> dict[str, str]:
         settings = self.profile_dir / "user" / "registrymodifications.xcu"
         try:
             current = settings.read_text(encoding="utf-8", errors="replace")
@@ -273,8 +302,8 @@ class LibreOfficeConverter:
                 "The document may be very large or damaged."
             ) from exc
         except OSError as exc:
-            log.error("Could not start LibreOffice: %s", exc.strerror)
-            raise ConversionFailedError(f"Could not start LibreOffice: {exc.strerror}") from exc
+            log.error("Could not start LibreOffice: %s", os_reason(exc))
+            raise ConversionFailedError(f"Could not start LibreOffice: {os_reason(exc)}") from exc
 
         # LibreOffice echoes the temporary paths it works on, which contain the Windows
         # user name; keep them out of logs and user-facing messages.
@@ -317,8 +346,16 @@ class LibreOfficeConverter:
 def libreoffice_converter(
     executable: Path, timeout: float = DEFAULT_TIMEOUT_SECONDS
 ) -> Iterator[LibreOfficeConverter]:
-    """A converter with throw-away LibreOffice profiles that are deleted afterwards."""
-    profile_root = Path(tempfile.mkdtemp(prefix="odt-profile-"))
+    """A converter with throw-away LibreOffice profiles that are deleted afterwards.
+
+    Raises ``TemporaryFolderError`` on entry if the profile folder cannot be created.
+    """
+    try:
+        profile_root = Path(tempfile.mkdtemp(prefix="odt-profile-"))
+    except OSError as exc:
+        raise TemporaryFolderError.from_os_error(
+            "create LibreOffice's profile folder in", exc
+        ) from exc
     try:
         yield LibreOfficeConverter(executable, profile_root, timeout)
     finally:

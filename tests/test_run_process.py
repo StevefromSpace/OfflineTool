@@ -1,14 +1,17 @@
 """Tests of the real subprocess runner, using the Python interpreter as a stand-in process."""
 
 import contextlib
+import errno
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 import pytest
 
+from offline_doc_tools.engine import ConversionError
 from offline_doc_tools.libreoffice import run_process
 
 # A parent that starts a long-sleeping grandchild (which inherits the output handles, as
@@ -133,3 +136,46 @@ def test_environment_is_passed_to_the_child():
     env = dict(os.environ, ODT_PROBE="from-parent")
     result = run_process([sys.executable, "-c", probe], 30, env=env)
     assert result.stdout == b"from-parent"
+
+
+def test_unusable_temp_folder_is_reported_as_such_and_nothing_is_started(tmp_path, monkeypatch):
+    # The output files live in the temporary folder. A failure to create them must not be
+    # reported as "could not start LibreOffice", and no process may be started without them.
+    missing = tmp_path / "Secret Person" / "gone"
+    monkeypatch.setattr(tempfile, "tempdir", str(missing))
+    with pytest.raises(OSError) as how_the_os_words_it, tempfile.TemporaryFile():
+        pass
+    reason = how_the_os_words_it.value.strerror
+
+    def never_started(*args, **kwargs):
+        raise AssertionError("a process was started")
+
+    monkeypatch.setattr(subprocess, "Popen", never_started)
+    with pytest.raises(ConversionError) as info:
+        run_process([sys.executable, "-c", "pass"], 30)
+
+    message = str(info.value)
+    assert not isinstance(info.value, OSError)
+    assert "temporary folder" in message
+    assert reason in message
+    assert "Secret Person" not in message
+    assert str(tmp_path) not in message
+
+
+def test_first_capture_file_is_closed_when_the_second_cannot_be_created(monkeypatch):
+    real = tempfile.TemporaryFile
+    created = []
+
+    def second_one_fails(*args, **kwargs):
+        if created:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        created.append(real(*args, **kwargs))
+        return created[0]
+
+    monkeypatch.setattr(tempfile, "TemporaryFile", second_one_fails)
+    with pytest.raises(ConversionError) as info:
+        run_process([sys.executable, "-c", "pass"], 30)
+
+    assert "temporary folder" in str(info.value)
+    assert "No space left on device" in str(info.value)
+    assert created and created[0].closed

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import threading
 from collections.abc import Callable, Sequence
@@ -58,3 +59,40 @@ class ConversionWorker(QObject):
             self.failed.emit(f"Unexpected error: {exc}")
             return
         self.finished.emit(summary)
+
+
+class BackgroundTask(QObject):
+    """Runs ``work(task)`` once on a daemon thread; reports ``done(result, error)``.
+
+    A plain thread, not a QThread: closing the window while a request is still running must never
+    wait for the network or tear down a running QThread. ``work`` may emit ``progress`` and should
+    look at ``cancelled()``. Exactly one of result and error is meaningful; an exception becomes
+    ``error`` (and is logged by type only, never with its text)."""
+
+    progress = Signal(int, int)  # done, total
+    done = Signal(object, object)  # result, error (an Exception or None)
+
+    def __init__(self, work: Callable[[BackgroundTask], object]) -> None:
+        super().__init__()
+        self._work = work
+        self._cancel = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel.set()
+
+    def cancelled(self) -> bool:
+        return self._cancel.is_set()
+
+    def start(self) -> None:
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self) -> None:
+        result: object = None
+        error: Exception | None = None
+        try:
+            result = self._work(self)
+        except Exception as exc:
+            log.error("Background task failed unexpectedly: %s", type(exc).__name__)
+            error = exc
+        with contextlib.suppress(RuntimeError):  # the window was closed meanwhile
+            self.done.emit(result, error)

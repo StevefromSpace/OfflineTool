@@ -8,10 +8,13 @@ import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
 
 from . import __version__
 from .main_window import MainWindow
+from .updater.helper import write_startup_marker
+from .updater.runtime import build_runtime
 
 log = logging.getLogger(__name__)
 
@@ -46,11 +49,27 @@ def configure_logging() -> None:
     sys.excepthook = _log_unhandled
 
 
+def safe_runtime():
+    """The updater, or None if setting it up fails: converting must never depend on it."""
+    try:
+        return build_runtime()
+    except Exception as exc:
+        log.error("Updates are unavailable: %s", type(exc).__name__)
+        return None
+
+
 def main() -> int:
+    if sys.argv[1:2] == ["--apply-update"]:
+        # The replacement helper: this executable, run from the staged update (see updater/).
+        from .updater import helper
+
+        return helper.main(sys.argv[2:])
     configure_logging()
     log.info("Starting version %s", __version__)
     app = QApplication(sys.argv)
     app.setApplicationName("Offline Doc Tools")
-    window = MainWindow()
+    window = MainWindow(updates=safe_runtime())
     window.show()
+    # Tells an update helper that this version came up (only when it asked for it).
+    QTimer.singleShot(0, lambda: write_startup_marker(os.environ, __version__))
     return app.exec()

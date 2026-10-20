@@ -39,3 +39,8 @@ Thumbs.db
 *.pptx
 *.ppt
 *.pdf
+
+# Release signing keys and update tokens must never be committed
+*.pem
+*.key
+update-token.bin

@@ -1,5 +1,8 @@
 """Conversion service tests, using a fake engine instead of LibreOffice."""
 
+import errno
+import os
+import tempfile
 import zipfile
 from pathlib import Path
 
@@ -7,9 +10,12 @@ import pytest
 
 from conftest import FAKE_PDF_BYTES, file_digest
 from offline_doc_tools.engine import (
+    ConversionError,
     ConversionFailedError,
     ConversionTimeoutError,
     InvalidInputError,
+    TemporaryFolderError,
+    os_reason,
 )
 from offline_doc_tools.service import (
     ConversionService,
@@ -440,3 +446,500 @@ def test_logs_contain_no_file_names_or_document_text(make_docx, output_dir, capl
     assert caplog.records, "expected the batch to be logged"
     for secret in ("Zebra-Confidential", "Okapi-Private", "TOPSECRET", str(good.parent)):
         assert secret not in caplog.text
+
+
+# --- temporary folder problems: reported as such, never as raw OS errors ----------------
+
+_USER = "Secret Person"  # stands in for the Windows user name inside a path
+
+
+def _missing_folder_reason(folder: Path) -> str:
+    """How this operating system words 'that folder does not exist'."""
+    try:
+        (folder / "probe").mkdir()
+    except OSError as exc:
+        return exc.strerror
+    raise AssertionError("the folder unexpectedly exists")
+
+
+def _assert_path_free(text: str, tmp_path: Path) -> None:
+    assert _USER not in text
+    assert str(tmp_path) not in text
+
+
+def _single_result(make_docx, output_dir):
+    summary = ConversionService(FakeConverter()).convert_batch([make_docx("a.docx")], output_dir)
+    [result] = summary.results
+    return result
+
+
+def test_missing_temp_folder_is_reported_before_anything_is_converted(
+    make_docx, output_dir, tmp_path, monkeypatch, caplog
+):
+    missing = tmp_path / _USER / "gone"
+    reason = _missing_folder_reason(missing)
+    monkeypatch.setattr(tempfile, "tempdir", str(missing))
+    caplog.set_level("DEBUG", logger="offline_doc_tools")
+    converter, started = FakeConverter(), []
+
+    with pytest.raises(ConversionError) as info:
+        ConversionService(converter).convert_batch(
+            [make_docx("a.docx")], output_dir, on_file_started=lambda *args: started.append(args)
+        )
+
+    message = str(info.value)
+    assert not isinstance(info.value, OSError)
+    assert "temporary folder" in message
+    assert reason in message
+    assert "Unexpected error" not in message
+    assert converter.seen == [] and started == []
+    assert caplog.records, "expected the problem to be logged"
+    _assert_path_free(message, tmp_path)
+    _assert_path_free(caplog.text, tmp_path)
+
+
+def test_unusable_default_temp_folders_are_reported_without_listing_them(
+    make_docx, output_dir, tmp_path, monkeypatch, caplog
+):
+    # With no TEMP/TMP that works, Python raises "No usable temporary directory found in
+    # [<every folder it tried>]": that text contains the user's profile path.
+    candidates = [str(tmp_path / _USER / "a"), str(tmp_path / _USER / "b")]
+    monkeypatch.setattr(tempfile, "tempdir", None)
+    monkeypatch.setattr(tempfile, "_candidate_tempdir_list", lambda: candidates)
+    caplog.set_level("DEBUG", logger="offline_doc_tools")
+
+    with pytest.raises(ConversionError) as info:
+        ConversionService(FakeConverter()).convert_batch([make_docx("a.docx")], output_dir)
+
+    assert "temporary folder" in str(info.value)
+    assert "No usable temporary directory found" in str(info.value)
+    _assert_path_free(str(info.value), tmp_path)
+    _assert_path_free(caplog.text, tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("make_error", "reason"),
+    [
+        (
+            lambda: PermissionError(
+                errno.EACCES, "Permission denied", rf"C:\Users\{_USER}\AppData\Local\Temp\x"
+            ),
+            "Permission denied",
+        ),
+        (
+            lambda: OSError(
+                errno.ENOSPC, "No space left on device", rf"C:\Users\{_USER}\AppData\Local\Temp"
+            ),
+            "No space left on device",
+        ),
+    ],
+    ids=["unwritable", "disk-full"],
+)
+def test_workspace_that_cannot_be_created_is_reported_clearly(
+    make_docx, output_dir, tmp_path, monkeypatch, caplog, make_error, reason
+):
+    def refuse(*args, **kwargs):
+        raise make_error()
+
+    monkeypatch.setattr(tempfile, "mkdtemp", refuse)
+    caplog.set_level("DEBUG", logger="offline_doc_tools")
+    converter = FakeConverter()
+
+    with pytest.raises(ConversionError) as info:
+        ConversionService(converter).convert_batch([make_docx("a.docx")], output_dir)
+
+    message = str(info.value)
+    assert "temporary folder" in message and reason in message
+    assert converter.seen == []
+    _assert_path_free(message, tmp_path)
+    _assert_path_free(caplog.text, tmp_path)
+
+
+def test_temp_folder_problems_have_their_own_error_type(
+    make_docx, output_dir, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "gone"))
+    with pytest.raises(TemporaryFolderError) as info:
+        ConversionService(FakeConverter()).convert_batch([make_docx("a.docx")], output_dir)
+    assert isinstance(info.value, ConversionError)
+
+
+def test_job_folder_failure_is_reported_as_a_temp_folder_problem(
+    make_docx, output_dir, tmp_path, monkeypatch, caplog
+):
+    real_mkdir = Path.mkdir
+    failed = []
+
+    def full_disk_once(self, *args, **kwargs):
+        if self.name == "out" and self.parent.name.startswith("job-") and not failed:
+            failed.append(self)
+            raise OSError(errno.ENOSPC, "No space left on device", str(self))
+        return real_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", full_disk_once)
+    caplog.set_level("DEBUG", logger="offline_doc_tools")
+    summary = ConversionService(FakeConverter()).convert_batch(
+        [make_docx("a.docx"), make_docx("b.docx")], output_dir
+    )
+
+    first, second = summary.results
+    assert first.status is FileStatus.FAILED
+    assert "temporary folder" in first.message
+    assert "No space left on device" in first.message
+    assert "Unexpected error" not in first.message
+    _assert_path_free(first.message, tmp_path)
+    _assert_path_free(caplog.text, tmp_path)
+    assert second.status is FileStatus.SUCCEEDED  # the batch carries on
+    assert not any("Unexpected conversion error" in r.getMessage() for r in caplog.records)
+
+
+def _copy_error(kind: str, src: Path, dst: Path) -> OSError:
+    locked = "The process cannot access the file because it is being used by another process"
+    return {
+        "disk-full": OSError(errno.ENOSPC, "No space left on device"),
+        "destination-denied": PermissionError(errno.EACCES, "Permission denied", os.fspath(dst)),
+        "destination-folder-gone": FileNotFoundError(
+            errno.ENOENT, "The system cannot find the path specified", os.fspath(dst)
+        ),
+        "source-locked": PermissionError(errno.EACCES, locked, os.fspath(src)),
+        "source-gone": FileNotFoundError(errno.ENOENT, "No such file", os.fspath(src)),
+        "source-unnamed": PermissionError(errno.EACCES, "Permission denied"),
+    }[kind]
+
+
+@pytest.mark.parametrize("kind", ["disk-full", "destination-denied", "destination-folder-gone"])
+def test_failure_writing_the_private_copy_blames_the_temp_folder(
+    make_docx, output_dir, tmp_path, monkeypatch, caplog, kind
+):
+    def failing_copy(src, dst, **kwargs):
+        raise _copy_error(kind, Path(src), Path(dst))
+
+    monkeypatch.setattr("offline_doc_tools.service.shutil.copyfile", failing_copy)
+    caplog.set_level("DEBUG", logger="offline_doc_tools")
+    result = _single_result(make_docx, output_dir)
+
+    assert result.status is FileStatus.FAILED
+    assert "temporary folder" in result.message
+    assert "cannot be read" not in result.message
+    assert "Unexpected error" not in result.message
+    _assert_path_free(result.message, tmp_path)
+    _assert_path_free(caplog.text, tmp_path)
+    assert list(output_dir.iterdir()) == []
+
+
+@pytest.mark.parametrize("kind", ["source-locked", "source-gone", "source-unnamed"])
+def test_failure_reading_the_source_still_blames_the_source(
+    make_docx, output_dir, tmp_path, monkeypatch, caplog, kind
+):
+    def failing_copy(src, dst, **kwargs):
+        raise _copy_error(kind, Path(src), Path(dst))
+
+    monkeypatch.setattr("offline_doc_tools.service.shutil.copyfile", failing_copy)
+    caplog.set_level("DEBUG", logger="offline_doc_tools")
+    result = _single_result(make_docx, output_dir)
+
+    assert result.status is FileStatus.FAILED
+    assert "The file cannot be read" in result.message
+    assert "temporary folder" not in result.message
+    _assert_path_free(result.message, tmp_path)
+    _assert_path_free(caplog.text, tmp_path)
+
+
+def test_unreadable_converted_pdf_is_a_temp_folder_problem(tmp_path, monkeypatch):
+    pdf = tmp_path / "result.pdf"
+    pdf.write_bytes(FAKE_PDF_BYTES)
+    real_open = Path.open
+
+    def locked(self, mode="r", *args, **kwargs):
+        if self == pdf:
+            raise PermissionError(errno.EACCES, "Permission denied", str(self))
+        return real_open(self, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", locked)
+    with pytest.raises(ConversionError) as info:
+        verify_pdf(pdf)
+    message = str(info.value)
+    assert "temporary folder" in message and "Permission denied" in message
+    _assert_path_free(message, tmp_path)
+
+
+def test_unreadable_staged_pdf_is_a_temp_folder_problem_and_creates_no_output(
+    tmp_path, output_dir, monkeypatch
+):
+    staged = _staged_pdf(tmp_path)
+    real_open = Path.open
+
+    def locked(self, mode="r", *args, **kwargs):
+        if self == staged:
+            raise PermissionError(errno.EACCES, "Permission denied", str(self))
+        return real_open(self, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", locked)
+    with pytest.raises(ConversionError) as info:
+        place_output(staged, output_dir, "doc")
+
+    message = str(info.value)
+    assert "temporary folder" in message and "Permission denied" in message
+    assert "output folder" not in message
+    _assert_path_free(message, tmp_path)
+    assert list(output_dir.iterdir()) == []
+
+
+def test_unexpected_os_errors_are_reported_without_their_paths(make_docx, output_dir):
+    error = PermissionError(errno.EACCES, "Permission denied", rf"C:\Users\{_USER}\x.pdf")
+    converter = FakeConverter(failures={"CRASH": error})
+    summary = ConversionService(converter).convert_batch(
+        [make_docx("c.docx", text="CRASH")], output_dir
+    )
+    assert summary.results[0].status is FileStatus.FAILED
+    assert "Permission denied" in summary.results[0].message
+    assert _USER not in summary.results[0].message
+
+
+# --- os_reason / TemporaryFolderError ---------------------------------------------------
+
+
+def test_os_reason_uses_the_operating_systems_wording():
+    exc = OSError(errno.ENOSPC, "No space left on device", rf"C:\Users\{_USER}\x")
+    assert os_reason(exc) == "No space left on device"
+
+
+def test_os_reason_falls_back_to_the_error_number_and_never_says_none():
+    assert os_reason(OSError(errno.EACCES, None)) == os.strerror(errno.EACCES)
+    for opaque in (OSError("opaque failure"), FileNotFoundError("Directory does not exist: x")):
+        reason = os_reason(opaque)
+        assert reason and "None" not in reason
+
+
+def test_os_reason_drops_the_folders_listed_by_python_when_no_temp_folder_works():
+    listing = rf"No usable temporary directory found in ['C:\Users\{_USER}\Temp', 'C:\TEMP']"
+    reason = os_reason(FileNotFoundError(errno.ENOENT, listing))
+    assert reason == "No usable temporary directory found"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        rf"cannot open C:\Users\{_USER}\x",
+        f"cannot open C:/Users/{_USER}/x",
+        f"//{_USER}/share unreachable",
+    ],
+)
+def test_os_reason_never_passes_a_path_through(text):
+    reason = os_reason(OSError(errno.ENOENT, text))
+    assert _USER not in reason
+    assert reason == os.strerror(errno.ENOENT)
+
+
+def test_temporary_folder_error_message():
+    error = TemporaryFolderError.from_os_error(
+        "copy the document into",
+        OSError(errno.ENOSPC, "No space left on device", rf"C:\Users\{_USER}\Temp\x"),
+    )
+    assert isinstance(error, ConversionFailedError)
+    message = str(error)
+    assert message.startswith(
+        "Could not copy the document into the temporary folder (No space left on device)."
+    )
+    assert "free space" in message
+    assert _USER not in message
+
+
+# --- logs carry the error category, never text derived from the user's files -------------
+
+
+def test_expected_failures_log_their_category_but_no_file_name_or_suffix(
+    tmp_path, output_dir, caplog
+):
+    caplog.set_level("DEBUG", logger="offline_doc_tools")
+    folder = tmp_path / "Heron-Private-Folder"
+    folder.mkdir()
+    odd_suffix = folder / "Zebra-Private.qwxyz9"
+    no_extension = folder / "Okapi-Private"
+    lock_file = folder / "~$Ibis-Private.docx"
+    missing = folder / "Lynx-Private.docx"
+    for path in (odd_suffix, no_extension):
+        path.write_bytes(b"data")
+    lock_file.write_bytes(b"\x05owner")
+
+    summary = ConversionService(FakeConverter()).convert_batch(
+        [odd_suffix, no_extension, lock_file, missing], output_dir
+    )
+
+    # The person using the app still gets the full explanation ...
+    messages = [r.message for r in summary.results]
+    assert all(r.status is FileStatus.FAILED for r in summary.results)
+    assert "Unsupported file type '.qwxyz9'" in messages[0]
+    assert "(no extension)" in messages[1]
+    assert "temporary lock file" in messages[2]
+    assert "does not exist" in messages[3]
+    # ... but the log only learns which kind of problem it was.
+    assert "InvalidInputError" in caplog.text
+    for secret in ("Zebra", "Okapi", "Ibis", "Lynx", "Private", "qwxyz9", str(tmp_path)):
+        assert secret not in caplog.text
+
+
+def test_engine_failure_messages_are_not_copied_into_the_log(make_docx, output_dir, caplog):
+    caplog.set_level("DEBUG", logger="offline_doc_tools")
+    converter = FakeConverter(
+        failures={
+            "FAIL-A": ConversionFailedError("LibreOffice said Heron-Private.odt is broken"),
+            "FAIL-B": ConversionTimeoutError("Okapi-Private did not finish"),
+        }
+    )
+    summary = ConversionService(converter).convert_batch(
+        [make_docx("a.docx", text="FAIL-A"), make_docx("b.docx", text="FAIL-B")], output_dir
+    )
+    assert "Heron-Private" in summary.results[0].message  # shown to the user ...
+    assert "ConversionFailedError" in caplog.text
+    assert "ConversionTimeoutError" in caplog.text
+    assert "Private" not in caplog.text  # ... but not written to the log
+
+
+# --- output-side file system errors: clear, actionable and free of paths ----------------
+
+
+def _fail_creating_output(monkeypatch, make_error):
+    """Make the exclusive create of the output PDF fail with ``make_error(path)``."""
+    real_open = Path.open
+
+    def failing_open(self, mode="r", *args, **kwargs):
+        if mode == "xb":
+            raise make_error(self)
+        return real_open(self, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", failing_open)
+
+
+@pytest.mark.parametrize(
+    ("make_error", "expected", "unwanted"),
+    [
+        (
+            lambda p: PermissionError(errno.EACCES, "Permission denied", str(p)),
+            ["Permission denied"],
+            [],
+        ),
+        (
+            lambda p: OSError(errno.ENOSPC, "No space left on device", str(p)),
+            ["No space left on device"],
+            [],
+        ),
+        # Windows reports a name over 255 characters as plain EINVAL.
+        (
+            lambda p: OSError(errno.EINVAL, "Invalid argument", str(p)),
+            ["too long"],
+            ["Invalid argument"],
+        ),
+        (
+            lambda p: OSError(errno.ENAMETOOLONG, "File name too long", str(p)),
+            ["too long"],
+            [],
+        ),
+        # Without long-path support Windows reports an over-long path as "not found" although
+        # the folder is still there.
+        (
+            lambda p: FileNotFoundError(errno.ENOENT, "No such file or directory", str(p)),
+            ["No such file or directory", "too long"],
+            [],
+        ),
+        (lambda p: OSError("opaque failure"), [], ["None"]),
+    ],
+    ids=[
+        "permission-denied",
+        "disk-full",
+        "invalid-argument",
+        "name-too-long",
+        "path-too-long-reported-as-not-found",
+        "no-reason-given",
+    ],
+)
+def test_output_folder_errors_are_clear_and_path_free(
+    make_docx, output_dir, tmp_path, monkeypatch, caplog, make_error, expected, unwanted
+):
+    _fail_creating_output(monkeypatch, make_error)
+    caplog.set_level("DEBUG", logger="offline_doc_tools")
+    result = _single_result(make_docx, output_dir)
+
+    assert result.status is FileStatus.FAILED
+    assert result.message.startswith("Could not write to the output folder")
+    for text in expected:
+        assert text in result.message
+    for text in unwanted:
+        assert text not in result.message
+    assert "Unexpected error" not in result.message
+    _assert_path_free(result.message, tmp_path)
+    _assert_path_free(caplog.text, tmp_path)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="winerror only exists on Windows")
+def test_windows_filename_too_long_error_is_explained(make_docx, output_dir, monkeypatch):
+    def too_long(path):
+        return OSError(errno.ENOENT, "The filename or extension is too long", str(path), 206)
+
+    _fail_creating_output(monkeypatch, too_long)
+    result = _single_result(make_docx, output_dir)
+    assert "too long" in result.message
+    assert "Unexpected error" not in result.message
+
+
+def test_output_folder_removed_mid_batch_says_so_without_naming_it(make_docx, tmp_path, caplog):
+    output_dir = tmp_path / _USER / "vanishing"
+    output_dir.mkdir(parents=True)
+
+    def remove_output_dir(index, total, result):
+        if index == 0:
+            for child in output_dir.iterdir():
+                child.unlink()
+            output_dir.rmdir()
+
+    caplog.set_level("DEBUG", logger="offline_doc_tools")
+    summary = ConversionService(FakeConverter()).convert_batch(
+        [make_docx("a.docx"), make_docx("b.docx")], output_dir, on_file_finished=remove_output_dir
+    )
+
+    message = summary.results[1].message
+    assert message.startswith("Could not write to the output folder")
+    assert "moved or deleted" in message
+    _assert_path_free(message, tmp_path)
+    _assert_path_free(caplog.text, tmp_path)
+
+
+def test_failed_cleanup_of_a_partial_output_does_not_hide_the_real_problem(
+    make_docx, output_dir, tmp_path, monkeypatch, caplog
+):
+    def broken_copy(src, dst):
+        dst.write(b"%PDF-partial")
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    def locked_unlink(self, *args, **kwargs):
+        raise PermissionError(errno.EACCES, "Permission denied", str(self))
+
+    monkeypatch.setattr("offline_doc_tools.service.shutil.copyfileobj", broken_copy)
+    monkeypatch.setattr(Path, "unlink", locked_unlink)
+    caplog.set_level("DEBUG", logger="offline_doc_tools")
+    result = _single_result(make_docx, output_dir)
+
+    assert result.status is FileStatus.FAILED
+    assert "Could not write the PDF to the output folder" in result.message
+    assert "No space left on device" in result.message
+    assert "incomplete" in result.message  # the person is told a partial file may remain
+    assert "Unexpected error" not in result.message
+    _assert_path_free(result.message, tmp_path)
+    _assert_path_free(caplog.text, tmp_path)
+
+
+def test_a_stat_error_on_a_candidate_name_does_not_stop_the_output(
+    tmp_path, output_dir, monkeypatch
+):
+    # Before Python 3.13, Path.exists() raises for errors other than "not found".
+    real_exists = Path.exists
+
+    def denied(self, *args, **kwargs):
+        if self.parent == output_dir:
+            raise PermissionError(errno.EACCES, "Permission denied", str(self))
+        return real_exists(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "exists", denied)
+    target = place_output(_staged_pdf(tmp_path), output_dir, "doc")
+    assert target == output_dir / "doc.pdf"
+    assert target.read_bytes() == FAKE_PDF_BYTES

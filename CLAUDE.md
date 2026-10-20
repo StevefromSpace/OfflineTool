@@ -3,6 +3,9 @@
 Offline, privacy-focused desktop app (PySide6) that converts `.docx` to PDF with a locally
 installed LibreOffice. Windows-first. See `docs/PLAN.md` for milestones and scope.
 
+**Status: development paused at the v0.1 checkpoint (2026-10-20).** See `docs/STATUS.md`. No new
+features; do not expand into a full document/PDF platform.
+
 ## Commands (Windows, from repo root)
 
 ```powershell
@@ -27,10 +30,18 @@ python -m venv .venv
 - `worker.py` — `QObject` run on a `QThread`; wraps the service and emits signals.
 - `main_window.py` — UI only. No conversion logic.
 - `app.py` — logging setup and entry point.
+- `updater/` — click-started self-update (no Qt imports): `manifest` + `ed25519` (signed
+  manifest), `github` (private releases), `package` (safe staging), `installer` + `helper`
+  (replacement with rollback, run by the staged new exe via `--apply-update`), `service`,
+  `runtime`. Run from `worker.BackgroundTask`, shown by `main_window.py`. See `docs/UPDATES.md`.
 
 ## Non-negotiable rules
 
-- No network access at runtime: no telemetry, update checks, downloads, cloud APIs.
+- No network access at runtime: no telemetry, downloads, cloud APIs. The one exception, requested
+  by the owner on 2026-10-19, is the click-started updater in `updater/` (private GitHub
+  releases, signed manifest, installs only after user confirmation, sends nothing about the user
+  or documents). No automatic or background checks, no unsigned or unverified installs, no token
+  or key in source; see `docs/PLAN.md` decision 11.
 - Keep `BlockUntrustedRefererLinks` in `_PROFILE_SETTINGS`: without it LibreOffice fetches
   images linked by URL and embeds linked local files. Guarded by
   `test_linked_images_are_neither_fetched_nor_embedded`; re-run it after LibreOffice upgrades.

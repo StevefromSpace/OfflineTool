@@ -23,6 +23,13 @@ dev = [
     "ruff==0.17.1",
 ]
 
+build = [
+    # Exact pins for scripts\packaging\build_windows.py (its isolated build environment).
+    "PySide6-Essentials==6.12.0",
+    "pyinstaller==6.22.2",
+    "pyinstaller-hooks-contrib==2026.6",
+]
+
 [project.gui-scripts]
 offline-doc-tools = "offline_doc_tools.app:main"
 
